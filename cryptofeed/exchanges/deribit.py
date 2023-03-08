@@ -8,7 +8,7 @@ from datetime import datetime
 
 from yapic import json
 
-from cryptofeed.connection import AsyncConnection
+from cryptofeed.connection import AsyncConnection, RestEndpoint, Routes, WebsocketEndpoint
 from cryptofeed.defines import BID, ASK, BUY, CANCELLED, DERIBIT, FAILED, FUNDING, FUTURES, L2_BOOK, LIMIT, LIQUIDATIONS, MAKER, MARKET, OPEN, OPEN_INTEREST, PERPETUAL, SELL, STOP_LIMIT, STOP_MARKET, TAKER, TICKER, TRADES, FILLED
 from cryptofeed.defines import CURRENCY, BALANCES, ORDER_INFO, FILLS, L1_BOOK
 from cryptofeed.feed import Feed
@@ -22,7 +22,9 @@ LOG = logging.getLogger('feedhandler')
 
 class Deribit(Feed, DeribitRestMixin):
     id = DERIBIT
-    symbol_endpoint = ['https://www.deribit.com/api/v2/public/get_instruments?currency=BTC', 'https://www.deribit.com/api/v2/public/get_instruments?currency=ETH']
+    websocket_endpoints = [WebsocketEndpoint('wss://www.deribit.com/ws/api/v2', sandbox='wss://test.deribit.com/ws/api/v2')]
+    rest_endpoints = [RestEndpoint('https://www.deribit.com', sandbox='https://test.deribit.com', routes=Routes(['/api/v2/public/get_instruments?currency=BTC', '/api/v2/public/get_instruments?currency=ETH', '/api/v2/public/get_instruments?currency=USDC', '/api/v2/public/get_instruments?currency=SOL']))]
+
     websocket_channels = {
         L1_BOOK: 'quote',
         L2_BOOK: 'book',
@@ -42,6 +44,10 @@ class Deribit(Feed, DeribitRestMixin):
         return ts / 1000.0
 
     @classmethod
+    def is_authenticated_channel(cls, channel: str) -> bool:
+        return channel in (ORDER_INFO, FILLS, BALANCES, L2_BOOK, TRADES, TICKER)
+
+    @classmethod
     def _parse_symbol_data(cls, data: list) -> Tuple[Dict, Dict]:
         ret = {}
         info = defaultdict(dict)
@@ -55,6 +61,8 @@ class Deribit(Feed, DeribitRestMixin):
                 quote = e['quote_currency']
                 stype = e['kind'] if e['settlement_period'] != 'perpetual' else PERPETUAL
                 otype = e.get('option_type')
+                if stype in ('option_combo', 'future_combo'):
+                    continue
                 strike_price = e.get('strike')
                 strike_price = int(strike_price) if strike_price else None
                 expiry = e['expiration_timestamp'] / 1000
@@ -67,10 +75,6 @@ class Deribit(Feed, DeribitRestMixin):
             ret[s.normalized] = currency
             info['instrument_type'][s.normalized] = CURRENCY
         return ret, info
-
-    def __init__(self, **kwargs):
-        super().__init__('wss://www.deribit.com/ws/api/v2', **kwargs)
-        self.__reset()
 
     def __reset(self):
         self._open_interest_cache = {}
@@ -321,8 +325,8 @@ class Deribit(Feed, DeribitRestMixin):
                     LOG.debug("%s: %s", conn.uuid, result)
                 elif id.startswith('auth') and "access_token" in result:
                     '''
-                        Access token is another way to be authenticated while sending messages to Deribit.
-                        In this implementation 'scope session' method is used instead of 'acces token' method.
+                    Access token is another way to be authenticated while sending messages to Deribit.
+                    In this implementation 'scope session' method is used instead of 'acces token' method.
                     '''
                     LOG.debug(f"{conn.uuid}: Access token received")
                 else:

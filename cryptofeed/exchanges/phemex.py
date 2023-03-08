@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2023 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -8,15 +8,14 @@ import hmac
 import time
 from collections import defaultdict
 from cryptofeed.symbols import Symbol
-from functools import partial
 import logging
 from decimal import Decimal
-from typing import Callable, Dict, List, Tuple
+from typing import Dict, Tuple
 
 from yapic import json
 
-from cryptofeed.connection import AsyncConnection, WSAsyncConn
-from cryptofeed.defines import BALANCES, BID, ASK, BUY, CANDLES, PHEMEX, L2_BOOK, SELL, TRADES
+from cryptofeed.connection import AsyncConnection, RestEndpoint, Routes, WebsocketEndpoint
+from cryptofeed.defines import BALANCES, BID, ASK, BUY, CANDLES, PHEMEX, L2_BOOK, SELL, TRADES, PERPETUAL
 from cryptofeed.feed import Feed
 from cryptofeed.types import OrderBook, Trade, Candle, Balance
 
@@ -25,9 +24,12 @@ LOG = logging.getLogger('feedhandler')
 
 class Phemex(Feed):
     id = PHEMEX
-    symbol_endpoint = 'https://api.phemex.com/exchange/public/cfg/v2/products'
+    websocket_endpoints = [WebsocketEndpoint('wss://phemex.com/ws', sandbox='wss://testnet.phemex.com/ws', limit=20)]
+    rest_endpoints = [RestEndpoint('https://api.phemex.com', routes=Routes('/exchange/public/cfg/v2/products'))]
     price_scale = {}
     valid_candle_intervals = ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1M', '1Q', '1Y')
+    candle_interval_map = {interval: second for interval, second in zip(valid_candle_intervals, [60, 300, 900, 1800, 3600, 14400, 86400, 604800, 2592000, 7776000, 31104000])}
+
     websocket_channels = {
         BALANCES: 'aop.subscribe',
         L2_BOOK: 'orderbook.subscribe',
@@ -48,8 +50,10 @@ class Phemex(Feed):
             if entry['status'] != 'Listed':
                 continue
             stype = entry['type'].lower()
-            base, quote = entry['displaySymbol'].split(" / ")
-            s = Symbol(base, quote, type=stype)
+            if "perpetual" in stype:    # can be "perpetualv2"
+                stype = PERPETUAL
+            base, quote = entry['displaySymbol'].split("/")
+            s = Symbol(base.strip(), quote.strip(), type=stype)
             ret[s.normalized] = entry['symbol']
             info['tick_size'][s.normalized] = entry['tickSize'] if 'tickSize' in entry else entry['quoteTickSize']
             info['instrument_type'][s.normalized] = stype
@@ -60,21 +64,18 @@ class Phemex(Feed):
         return ret, info
 
     def __init__(self, **kwargs):
-        super().__init__('wss://phemex.com/ws', **kwargs)
-        seconds = [60, 300, 900, 1800, 3600, 14400, 86400, 604800, 2592000, 7776000, 31104000]
-        self.candle_interval_map = {
-            interval: second for interval, second in zip(self.valid_candle_intervals, seconds)
-        }
-
+        super().__init__(**kwargs)
         # Phemex only allows 5 connections, with 20 subscriptions per connection, check we arent over the limit
-        items = len(self.subscription.keys()) * sum(len(v) for v in self.subscription.values())
-        if items > 100:
+        if sum(map(len, self.subscription.values())) > 100:
             raise ValueError(f"{self.id} only allows a maximum of 100 symbol/channel subscriptions")
 
-        self.__reset()
+    def __reset(self, conn: AsyncConnection):
+        if self.std_channel_to_exchange(L2_BOOK) in conn.subscription:
+            for pair in conn.subscription[self.std_channel_to_exchange(L2_BOOK)]:
+                std_pair = self.exchange_symbol_to_std_symbol(pair)
 
-    def __reset(self):
-        self._l2_book = {}
+                if std_pair in self._l2_book:
+                    del self._l2_book[std_pair]
 
     async def _book(self, msg: dict, timestamp: float):
         """
@@ -98,11 +99,11 @@ class Phemex(Feed):
 
         if msg['type'] == 'snapshot':
             delta = None
-            self._l2_book[symbol] = OrderBook(self.id, symbol, max_depth=self.max_depth, bids={Decimal(entry[0] / self.price_scale[symbol]): Decimal(entry[1]) for entry in msg['book']['bids']}, asks={Decimal(entry[0] / self.price_scale[symbol]): Decimal(entry[1]) for entry in msg['book']['asks']})
+            self._l2_book[symbol] = OrderBook(self.id, symbol, max_depth=self.max_depth, bids={Decimal(entry[0]) / Decimal(self.price_scale[symbol]): Decimal(entry[1]) for entry in msg['book']['bids']}, asks={Decimal(entry[0]) / Decimal(self.price_scale[symbol]): Decimal(entry[1]) for entry in msg['book']['asks']})
         else:
             for key, side in (('asks', ASK), ('bids', BID)):
                 for price, amount in msg['book'][key]:
-                    price = Decimal(price / self.price_scale[symbol])
+                    price = Decimal(price) / Decimal(self.price_scale[symbol])
                     amount = Decimal(amount)
                     delta[side].append((price, amount))
                     if amount == 0:
@@ -132,7 +133,7 @@ class Phemex(Feed):
                 symbol,
                 BUY if side == 'Buy' else SELL,
                 Decimal(amount),
-                Decimal(price / self.price_scale[symbol]),
+                Decimal(price) / Decimal(self.price_scale[symbol]),
                 self.timestamp_normalize(ts),
                 raw=msg
             )
@@ -152,7 +153,7 @@ class Phemex(Feed):
         symbol = self.exchange_symbol_to_std_symbol(msg['symbol'])
 
         for entry in msg['kline']:
-            ts, _, _, open, high, low, close, _, volume = entry
+            ts, _, _, open, high, low, close, volume, _ = entry
             c = Candle(
                 self.id,
                 symbol,
@@ -160,10 +161,10 @@ class Phemex(Feed):
                 ts + self.candle_interval_map[self.candle_interval],
                 self.candle_interval,
                 None,
-                Decimal(open / self.price_scale[symbol]),
-                Decimal(close / self.price_scale[symbol]),
-                Decimal(high / self.price_scale[symbol]),
-                Decimal(low / self.price_scale[symbol]),
+                Decimal(open) / Decimal(self.price_scale[symbol]),
+                Decimal(close) / Decimal(self.price_scale[symbol]),
+                Decimal(high) / Decimal(self.price_scale[symbol]),
+                Decimal(low) / Decimal(self.price_scale[symbol]),
                 Decimal(volume),
                 None,
                 None
@@ -600,33 +601,7 @@ class Phemex(Feed):
             )
             await self.callback(BALANCES, b, timestamp)
 
-    def connect(self) -> List[Tuple[AsyncConnection, Callable[[None], None], Callable[[str, float], None]]]:
-        # Phemex only allows 5 connections, with 20 subscriptions per connection, so split the subscription into separate
-        # connections if necessary
-        ret = []
-        sub_pair = []
-
-        if self.std_channel_to_exchange(BALANCES) in self.subscription:
-            sub_pair.append([self.std_channel_to_exchange(BALANCES), BALANCES])
-
-        for chan, symbols in self.subscription.items():
-            if self.exchange_channel_to_std(chan) == BALANCES:
-                continue
-            for sym in symbols:
-                sub_pair.append([chan, sym])
-                if len(sub_pair) == 20:
-                    func = partial(self.subscribe, subs=sub_pair)
-                    ret.append((WSAsyncConn(self.address, self.id, **self.ws_defaults), func, self.message_handler, self.authenticate))
-                    sub_pair = []
-
-        if len(sub_pair) > 0:
-            func = partial(self.subscribe, subs=sub_pair)
-            ret.append((WSAsyncConn(self.address, self.id, **self.ws_defaults), func, self.message_handler, self.authenticate))
-
-        return ret
-
     async def message_handler(self, msg: str, conn: AsyncConnection, timestamp: float):
-
         msg = json.loads(msg, parse_float=Decimal)
 
         if 'id' in msg and msg['id'] == 100:
@@ -661,16 +636,17 @@ class Phemex(Feed):
         else:
             LOG.warning("%s: Invalid message type %s", conn.uuid, msg)
 
-    async def subscribe(self, conn: AsyncConnection, subs=None):
-        self.__reset()
+    async def subscribe(self, conn: AsyncConnection):
+        self.__reset(conn)
 
-        for chan, symbol in subs:
+        for chan, symbols in conn.subscription.items():
             if not self.exchange_channel_to_std(chan) == BALANCES:
-                msg = {"id": 1, "method": chan, "params": [symbol]}
-                if self.exchange_channel_to_std(chan) == CANDLES:
-                    msg['params'] = [symbol, self.candle_interval_map[self.candle_interval]]
-                LOG.debug(f"{conn.uuid}: Sending subscribe request to public channel: {msg}")
-                await conn.write(json.dumps(msg))
+                for sym in symbols:
+                    msg = {"id": 1, "method": chan, "params": [sym]}
+                    if self.exchange_channel_to_std(chan) == CANDLES:
+                        msg['params'] = [*[sym], self.candle_interval_map[self.candle_interval]]
+                    LOG.debug(f"{conn.uuid}: Sending subscribe request to public channel: {msg}")
+                    await conn.write(json.dumps(msg))
 
     async def authenticate(self, conn: AsyncConnection):
         if any(self.is_authenticated_channel(self.exchange_channel_to_std(chan)) for chan in self.subscription):

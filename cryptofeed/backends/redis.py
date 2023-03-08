@@ -1,50 +1,34 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2023 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
 '''
 from collections import defaultdict
-import asyncio
 
-import aioredis
+from redis import asyncio as aioredis
 from yapic import json
 
 from cryptofeed.backends.backend import BackendBookCallback, BackendCallback, BackendQueue
 
 
-def trades_none_to_str(data):
-    data['type'] = str(data['type'])
-    data['id'] = str(data['id'])
-
-
 class RedisCallback(BackendQueue):
-    def __init__(self, host='127.0.0.1', port=6379, socket=None, key=None, numeric_type=float, writer_interval=0.01, **kwargs):
+    def __init__(self, host='127.0.0.1', port=6379, socket=None, key=None, none_to='None', numeric_type=float, **kwargs):
         """
         setting key lets you override the prefix on the
         key used in redis. The defaults are related to the data
         being stored, i.e. trade, funding, etc
-
-        writer_interval:
-        the frequency writer sleep when there is nothing in
-        data queue. 0 makes this thread consuming a lot of CPU.
-        while large interval put pressure on queue.
         """
         prefix = 'redis://'
         if socket:
             prefix = 'unix://'
+            port = None
 
-        self.redis = aioredis.from_url(f"{prefix}{host}:{port}")
+        self.redis = f"{prefix}{host}" + f":{port}" if port else ""
         self.key = key if key else self.default_key
         self.numeric_type = numeric_type
+        self.none_to = none_to
         self.running = True
-        self.exited = False
-        self.writer_interval = writer_interval
-
-    async def stop(self):
-        self.running = False
-        while not self.exited:
-            await asyncio.sleep(0.1)
 
 
 class RedisZSetCallback(RedisCallback):
@@ -58,70 +42,63 @@ class RedisZSetCallback(RedisCallback):
         self.score_key = score_key
         super().__init__(host=host, port=port, socket=socket, key=key, numeric_type=numeric_type, **kwargs)
 
-    async def write(self, data: dict):
-        score = data[self.score_key]
-        await self.queue.put({'score': score, 'data': data})
-
     async def writer(self):
+        conn = aioredis.from_url(self.redis)
+
         while self.running:
+            async with self.read_queue() as updates:
+                async with conn.pipeline(transaction=False) as pipe:
+                    for update in updates:
+                        pipe = pipe.zadd(f"{self.key}-{update['exchange']}-{update['symbol']}", {json.dumps(update): update[self.score_key]}, nx=True)
+                    await pipe.execute()
 
-            count = self.queue.qsize()
-            if count == 0:
-                await asyncio.sleep(self.writer_interval)
-            elif count > 1:
-                async with self.read_many_queue(count) as updates:
-                    async with self.redis.pipeline(transaction=False) as pipe:
-                        for update in updates:
-                            pipe = pipe.zadd(f"{self.key}-{update['data']['exchange']}-{update['data']['symbol']}", {json.dumps(update['data']): update['score']}, nx=True)
-                        await pipe.execute()
-            else:
-                async with self.read_queue() as update:
-                    await self.redis.zadd(f"{self.key}-{update['data']['exchange']}-{update['data']['symbol']}", {json.dumps(update['data']): update['score']}, nx=True)
-
-        await self.redis.close()
-        await self.redis.connection_pool.disconnect()
-        self.exited = True
+        await conn.close()
+        await conn.connection_pool.disconnect()
 
 
 class RedisStreamCallback(RedisCallback):
-    async def write(self, data: dict):
-        await self.queue.put(data)
+    async def writer(self):
+        conn = aioredis.from_url(self.redis)
+
+        while self.running:
+            async with self.read_queue() as updates:
+                async with conn.pipeline(transaction=False) as pipe:
+                    for update in updates:
+                        if 'delta' in update:
+                            update['delta'] = json.dumps(update['delta'])
+                        elif 'book' in update:
+                            update['book'] = json.dumps(update['book'])
+                        elif 'closed' in update:
+                            update['closed'] = str(update['closed'])
+
+                        pipe = pipe.xadd(f"{self.key}-{update['exchange']}-{update['symbol']}", update)
+                    await pipe.execute()
+
+        await conn.close()
+        await conn.connection_pool.disconnect()
+
+
+class RedisKeyCallback(RedisCallback):
 
     async def writer(self):
+        conn = aioredis.from_url(self.redis)
+
         while self.running:
+            async with self.read_queue() as updates:
+                update = list(updates)[-1]
+                if update:
+                    await conn.set(f"{self.key}-{update['exchange']}-{update['symbol']}", json.dumps(update))
 
-            count = self.queue.qsize()
-            if count == 0:
-                await asyncio.sleep(self.writer_interval)
-            elif count > 1:
-                async with self.read_many_queue(count) as updates:
-                    async with self.redis.pipeline(transaction=False) as pipe:
-                        for update in updates:
-                            pipe = pipe.xadd(f"{self.key}-{update['exchange']}-{update['symbol']}", update)
-                        await pipe.execute()
-            else:
-                async with self.read_queue() as update:
-                    await self.redis.xadd(f"{self.key}-{update['exchange']}-{update['symbol']}", update)
-
-        await self.redis.close()
-        await self.redis.connection_pool.disconnect()
-        self.exited = True
+        await conn.close()
+        await conn.connection_pool.disconnect()
 
 
 class TradeRedis(RedisZSetCallback, BackendCallback):
     default_key = 'trades'
 
-    async def write(self, data):
-        trades_none_to_str(data)
-        await super().write(data)
-
 
 class TradeStream(RedisStreamCallback, BackendCallback):
     default_key = 'trades'
-
-    async def write(self, data):
-        trades_none_to_str(data)
-        await super().write(data)
 
 
 class FundingRedis(RedisZSetCallback, BackendCallback):
@@ -141,14 +118,6 @@ class BookRedis(RedisZSetCallback, BackendBookCallback):
         self.snapshot_count = defaultdict(int)
         super().__init__(*args, score_key=score_key, **kwargs)
 
-    async def write(self, data: dict):
-        if not self.snapshots_only:
-            if 'delta' in data and data['delta'] is None:
-                data['delta'] = 'None'
-        if data['timestamp'] is None:
-            data['timestamp'] = 'None'
-        await super().write(data)
-
 
 class BookStream(RedisStreamCallback, BackendBookCallback):
     default_key = 'book'
@@ -159,15 +128,15 @@ class BookStream(RedisStreamCallback, BackendBookCallback):
         self.snapshot_count = defaultdict(int)
         super().__init__(*args, **kwargs)
 
-    async def write(self, data: dict):
-        if 'delta' in data:
-            data['delta'] = json.dumps(data['delta'])
-        elif 'book' in data:
-            data['book'] = json.dumps(data['book'])
 
-        if data['timestamp'] is None:
-            data['timestamp'] = 'None'
-        await super().write(data)
+class BookSnapshotRedisKey(RedisKeyCallback, BackendBookCallback):
+    default_key = 'book'
+
+    def __init__(self, *args, snapshot_interval=1000, score_key='receipt_timestamp', **kwargs):
+        kwargs['snapshots_only'] = True
+        self.snapshot_interval = snapshot_interval
+        self.snapshot_count = defaultdict(int)
+        super().__init__(*args, score_key=score_key, **kwargs)
 
 
 class TickerRedis(RedisZSetCallback, BackendCallback):
@@ -201,6 +170,34 @@ class CandlesRedis(RedisZSetCallback, BackendCallback):
 class CandlesStream(RedisStreamCallback, BackendCallback):
     default_key = 'candles'
 
-    async def write(self, data: dict):
-        data['closed'] = str(data['closed'])
-        await super().write(data)
+
+class OrderInfoRedis(RedisZSetCallback, BackendCallback):
+    default_key = 'order_info'
+
+
+class OrderInfoStream(RedisStreamCallback, BackendCallback):
+    default_key = 'order_info'
+
+
+class TransactionsRedis(RedisZSetCallback, BackendCallback):
+    default_key = 'transactions'
+
+
+class TransactionsStream(RedisStreamCallback, BackendCallback):
+    default_key = 'transactions'
+
+
+class BalancesRedis(RedisZSetCallback, BackendCallback):
+    default_key = 'balances'
+
+
+class BalancesStream(RedisStreamCallback, BackendCallback):
+    default_key = 'balances'
+
+
+class FillsRedis(RedisZSetCallback, BackendCallback):
+    default_key = 'fills'
+
+
+class FillsStream(RedisStreamCallback, BackendCallback):
+    default_key = 'fills'

@@ -1,20 +1,23 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import logging
 import time
 from typing import Dict, Tuple
+import uuid
 import zlib
 from decimal import Decimal
 
 import requests
 from yapic import json
 
-from cryptofeed.connection import AsyncConnection
-from cryptofeed.defines import BID, ASK, BITTREX, BUY, CANDLES, L2_BOOK, SELL, TICKER, TRADES
+from cryptofeed.connection import AsyncConnection, RestEndpoint, Routes, WebsocketEndpoint
+from cryptofeed.defines import BALANCES, BID, ASK, BITTREX, BUY, CANDLES, L2_BOOK, SELL, TICKER, TRADES, ORDER_INFO, CLOSED, OPEN, SUBMITTING, MARKET, LIMIT
 from cryptofeed.feed import Feed
 from cryptofeed.symbols import Symbol
 from cryptofeed.exceptions import MissingSequenceNumber
-from cryptofeed.types import OrderBook, Trade, Ticker, Candle
+from cryptofeed.types import OrderBook, Trade, Ticker, Candle, OrderInfo, Balance
 
 
 LOG = logging.getLogger('feedhandler')
@@ -22,14 +25,18 @@ LOG = logging.getLogger('feedhandler')
 
 class Bittrex(Feed):
     id = BITTREX
-    symbol_endpoint = 'https://api.bittrex.com/v3/markets'
+    websocket_endpoints = [WebsocketEndpoint('wss://www.bitmex.com/realtime', authentication=True)]
+    rest_endpoints = [RestEndpoint('https://api.bittrex.com', routes=Routes('/v3/markets', l2book='/v3/markets/{}/orderbook?depth={}'))]
+
     valid_candle_intervals = {'1m', '5m', '1h', '1d'}
     valid_depths = [1, 25, 500]
     websocket_channels = {
         L2_BOOK: 'orderbook_{}_{}',
         TRADES: 'trade_{}',
         TICKER: 'ticker_{}',
-        CANDLES: 'candle_{}_{}'
+        CANDLES: 'candle_{}_{}',
+        ORDER_INFO: 'order',
+        BALANCES: 'balance'
     }
 
     @classmethod
@@ -44,13 +51,13 @@ class Bittrex(Feed):
             info['instrument_type'][s.normalized] = s.type
         return ret, info
 
-    def __init__(self, **kwargs):
-        super().__init__('wss://socket-v3.bittrex.com/signalr/connect', **kwargs)
-        r = requests.get('https://socket-v3.bittrex.com/signalr/negotiate', params={'connectionData': json.dumps([{'name': 'c3'}]), 'clientProtocol': 1.5})
-        token = r.json()['ConnectionToken']
+    async def _ws_authentication(self, address: str, options: dict) -> Tuple[str, dict]:
+        # Technically this isnt authentication, its the negotiation step for SignalR that
+        # we are performing here since this method is called right before connecting
+        r = self.http_sync.read('https://socket-v3.bittrex.com/signalr/negotiate', params={'connectionData': json.dumps([{'name': 'c3'}]), 'clientProtocol': 1.5}, json=True)
+        token = r['ConnectionToken']
         url = requests.Request('GET', 'https://socket-v3.bittrex.com/signalr/connect', params={'transport': 'webSockets', 'connectionToken': token, 'connectionData': json.dumps([{"name": "c3"}]), 'clientProtocol': 1.5}).prepare().url
-        url = url.replace('https://', 'wss://')
-        self.address = url
+        return url.replace('https://', 'wss://'), options
 
     def __reset(self):
         self._l2_book = {}
@@ -145,7 +152,7 @@ class Bittrex(Feed):
 
     async def _snapshot(self, symbol: str, sequence_number: int):
         while True:
-            ret, headers = await self.http_conn.read(f'https://api.bittrex.com/v3/markets/{symbol}/orderbook?depth={self.__depth()}', return_headers=True)
+            ret, headers = await self.http_conn.read(self.rest_endpoints[0].route('l2book', self.sandbox).format(symbol, self.__depth()), return_headers=True)
             seq = int(headers['Sequence'])
             if seq >= sequence_number:
                 break
@@ -236,9 +243,88 @@ class Bittrex(Feed):
         )
         await self.callback(CANDLES, c, timestamp)
 
+    async def order(self, msg: dict, timestamp: float):
+        """
+        example message:
+        {
+            "accountId": "17f2b2e3-ff86-4357-a76b-34124ee30274",
+            "sequence": 22606,
+            "delta": {
+                "id": "01fa3794-10cf-4897-bc47-c96f15135f34",
+                "marketSymbol": "VLX-USDT",
+                "direction": "SELL",
+                "type": "LIMIT",
+                "quantity": "50.00000000",
+                "limit": "0.049000000000",
+                "timeInForce": "GOOD_TIL_CANCELLED",
+                "fillQuantity": "0.00000000",
+                "commission": "0.00000000",
+                "proceeds": "0.00000000",
+                "status": "OPEN",
+                "createdAt": "2022-08-05T15:04:16.02Z",
+                "updatedAt": "2022-08-05T15:04:16.02Z"
+            }
+        }
+        """
+        order = msg['delta']
+        status = order['status']
+        if status == 'new':
+            status = SUBMITTING
+            # There was no observation made, that there are more than "OPEN" and "CLOSED". Needs Support clarification with BITTREX.
+        elif status == 'OPEN':
+            status = OPEN
+        elif status == 'CLOSED':
+            status = CLOSED
+
+        remainingSize = Decimal(order['quantity']) - Decimal(order['fillQuantity'])
+
+        oi = OrderInfo(
+            self.id,
+            self.exchange_symbol_to_std_symbol(order['marketSymbol']),
+            str(order['id']),
+            BUY if order['direction'].lower() == 'buy' else SELL,
+            status,
+            LIMIT if order['type'].lower() == 'limit' else MARKET,
+            Decimal(order['limit']) if 'limit' in order else None,
+            Decimal(order['fillQuantity']),  # the filled Size
+            remainingSize,  # the remaining Size
+            timestamp=str(order['createdAt']),
+            client_order_id=order['clientOrderId'] if 'clientOrderId' in order else None,
+            # account=self.subaccount,
+            raw=msg
+        )
+        await self.callback(ORDER_INFO, oi, timestamp)
+
+    async def balance(self, msg: dict, timestamp: float):
+        """
+            {
+                "accountId": "17f42de3-ff86-4357-a76b-34124ee30c63",
+                "sequence": 33119,
+                "delta": {
+                    "currencySymbol": "VLX",
+                    "total": "636.02206857",
+                    "available": "0.00000000",
+                    "updatedAt": "2022-08-05T13:46:31.73Z"
+                }
+            }
+        """
+        delta = msg["delta"]
+        available = Decimal(delta["available"])
+        locked = Decimal(delta["total"]) - available
+        bal = Balance(
+            self.id,
+            delta['currencySymbol'],
+            available,
+            locked,
+            raw=msg
+        )
+        await self.callback(BALANCES, bal, timestamp)
+
     async def message_handler(self, msg: str, conn, timestamp: float):
         msg = json.loads(msg)
-        if 'M' in msg and len(msg['M']) > 0:
+        if 'R' in msg and ('Success') in msg['R']:
+            LOG.info(f"Authenticated for private subscriptions: {msg['R']['Success']}")
+        elif 'M' in msg and len(msg['M']) > 0:
             for update in msg['M']:
                 if update['M'] == 'orderBook':
                     for message in update['A']:
@@ -256,10 +342,37 @@ class Bittrex(Feed):
                     for message in update['A']:
                         data = json.loads(zlib.decompress(base64.b64decode(message), -zlib.MAX_WBITS).decode(), parse_float=Decimal)
                         await self.candle(data, timestamp)
+                elif update['M'] == 'order':
+                    for message in update['A']:
+                        data = json.loads(zlib.decompress(base64.b64decode(message), -zlib.MAX_WBITS).decode(), parse_float=Decimal)
+                        await self.order(data, timestamp)
+                elif update['M'] == 'balance':
+                    for message in update['A']:
+                        data = json.loads(zlib.decompress(base64.b64decode(message), -zlib.MAX_WBITS).decode(), parse_float=Decimal)
+                        await self.balance(data, timestamp)
+                elif update['M'] == 'authenticationExpiring':
+                    # WARNING : BITTREX: Invalid message type {'C': 'd-942EDED9-B,0|Bjh,1|Bji,3|Bjj,0|Bjk,0', 'M': [{'H': 'C3', 'M': 'authenticationExpiring', 'A': []}]}
+                    LOG.debug("%s: private subscription authentication expired. %s", self.id, msg)
                 else:
                     LOG.warning("%s: Invalid message type %s", self.id, msg)
         elif 'E' in msg:
             LOG.error("%s: Error from exchange %s", self.id, msg)
+
+    async def generate_token(self, conn: AsyncConnection):
+        timestamp = str(int(time.time()) * 1000)
+        random_content = str(uuid.uuid4())
+        content = timestamp + random_content
+        signed_content = hmac.new(self.key_secret.encode(), content.encode(), hashlib.sha512).hexdigest()
+
+        msg = {'A': [self.key_id, timestamp, random_content, signed_content], 'H': 'c3', 'I': 0, 'M': 'Authenticate'}
+        # There is only subacounts on BITTREX for institutional customers.
+        # if self.subaccount:
+        #     msg['args']['subaccount'] = self.subaccount
+        await conn.write(json.dumps(msg))
+
+    async def authenticate(self, conn: AsyncConnection):
+        if self.requires_authentication:
+            await self.generate_token(conn)
 
     async def subscribe(self, conn: AsyncConnection):
         self.__reset()
@@ -270,23 +383,31 @@ class Bittrex(Feed):
         for chan in self.subscription:
             channel = self.exchange_channel_to_std(chan)
             i = 1
-            for symbol in self.subscription[chan]:
-                if channel == L2_BOOK:
-                    msg = {'A': ([chan.format(symbol, self.__depth())],), 'H': 'c3', 'I': i, 'M': 'Subscribe'}
-                elif channel in (TRADES, TICKER):
-                    msg = {'A': ([chan.format(symbol)],), 'H': 'c3', 'I': i, 'M': 'Subscribe'}
-                elif channel == CANDLES:
-                    interval = None
-                    if self.candle_interval == '1m':
-                        interval = 'MINUTE_1'
-                    elif self.candle_interval == '5m':
-                        interval = 'MINUTE_5'
-                    elif self.candle_interval == '1h':
-                        interval = 'HOUR_1'
-                    elif self.candle_interval == '1d':
-                        interval = 'DAY_1'
-                    msg = {'A': ([chan.format(symbol, interval)],), 'H': 'c3', 'I': i, 'M': 'Subscribe'}
-                else:
-                    LOG.error("%s: invalid subscription for channel %s", channel)
+            # If we subscribe to ORDER_INFO, then that is registered for all symbols in our account.
+            # if channel in (ORDER_INFO, BALANCES):
+            if self.is_authenticated_channel(self.exchange_channel_to_std(chan)):
+                msg = {'A': ([chan],), 'H': 'c3', 'I': i, 'M': 'Subscribe'}
                 await conn.write(json.dumps(msg))
                 i += 1
+            else:
+                for symbol in self.subscription[chan]:
+                    if channel == L2_BOOK:
+                        msg = {'A': ([chan.format(symbol, self.__depth())],), 'H': 'c3', 'I': i, 'M': 'Subscribe'}
+                    elif channel in (TRADES, TICKER):
+                        msg = {'A': ([chan.format(symbol)],), 'H': 'c3', 'I': i, 'M': 'Subscribe'}
+                        LOG.info(f"loop subscribed: {([chan.format(symbol)],)}")
+                    elif channel == CANDLES:
+                        interval = None
+                        if self.candle_interval == '1m':
+                            interval = 'MINUTE_1'
+                        elif self.candle_interval == '5m':
+                            interval = 'MINUTE_5'
+                        elif self.candle_interval == '1h':
+                            interval = 'HOUR_1'
+                        elif self.candle_interval == '1d':
+                            interval = 'DAY_1'
+                        msg = {'A': ([chan.format(symbol, interval)],), 'H': 'c3', 'I': i, 'M': 'Subscribe'}
+                    else:
+                        LOG.error("%s: invalid subscription for channel %s", channel)
+                    await conn.write(json.dumps(msg))
+                    i += 1

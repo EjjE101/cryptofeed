@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2023 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -14,7 +14,7 @@ from cryptofeed.backends.backend import BackendBookCallback, BackendCallback
 
 
 class RabbitCallback:
-    def __init__(self, host='localhost', numeric_type=float, queue_name='cryptofeed', exchange_mode=False, exchange_name='amq.topic', exchange_type='topic', routing_key='cryptofeed', **kwargs):
+    def __init__(self, host='localhost', none_to=None, numeric_type=float, queue_name='cryptofeed', exchange_mode=False, exchange_name='amq.topic', exchange_type='topic', routing_key='cryptofeed', **kwargs):
         """
         Parameters
         ----------
@@ -27,13 +27,14 @@ class RabbitCallback:
             name of AMQP exchange
         exchange_type: str
             exchange type
-            String values must be one of ‘fanout’, ‘direct’, ‘topic’, ‘headers’, ‘x-delayed-message’, ‘x-consistent-hash'
+            String values must be one of 'fanout', 'direct', 'topic', 'headers', 'x-delayed-message', 'x-consistent-hash'
         routing_key: str
             definable amqp routing key
         """
         self.conn = None
         self.host = host
         self.numeric_type = numeric_type
+        self.none_to = none_to
         self.queue_name = queue_name
         self.exchange_mode = exchange_mode
         self.exchange_name = exchange_name
@@ -99,4 +100,20 @@ class LiquidationsRabbit(RabbitCallback, BackendCallback):
 
 
 class CandlesRabbit(RabbitCallback, BackendCallback):
+    pass
+
+
+class OrderInfoRabbit(RabbitCallback, BackendCallback):
+    pass
+
+
+class TransactionsRabbit(RabbitCallback, BackendCallback):
+    pass
+
+
+class BalancesRabbit(RabbitCallback, BackendCallback):
+    pass
+
+
+class FillsRabbit(RabbitCallback, BackendCallback):
     pass

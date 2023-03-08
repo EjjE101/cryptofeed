@@ -1,18 +1,21 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2023 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
+
+Book backends are intentionally left out here - Arctic cannot handle high throughput
+data like book data. Arctic is best used for writing large datasets in batches.
 '''
 import arctic
 import pandas as pd
 
 from cryptofeed.backends.backend import BackendCallback
-from cryptofeed.defines import CANDLES, FUNDING, OPEN_INTEREST, TICKER, TRADES, LIQUIDATIONS
+from cryptofeed.defines import BALANCES, CANDLES, FILLS, FUNDING, OPEN_INTEREST, ORDER_INFO, TICKER, TRADES, LIQUIDATIONS, TRANSACTIONS
 
 
 class ArcticCallback:
-    def __init__(self, library, host='127.0.0.1', key=None, numeric_type=float, quota=0, ssl=False, **kwargs):
+    def __init__(self, library, host='127.0.0.1', key=None, none_to=None, numeric_type=float, quota=0, ssl=False, **kwargs):
         """
         library: str
             arctic library. Will be created if does not exist.
@@ -36,12 +39,15 @@ class ArcticCallback:
         self.lib = con[library]
         self.key = key if key else self.default_key
         self.numeric_type = numeric_type
+        self.none_to = none_to
 
     async def write(self, data):
         df = pd.DataFrame({key: [value] for key, value in data.items()})
         df['date'] = pd.to_datetime(df.timestamp, unit='s')
         df['receipt_timestamp'] = pd.to_datetime(df.receipt_timestamp, unit='s')
         df.set_index(['date'], inplace=True)
+        if 'type' in df and df.type.isna().any():
+            df.drop(columns=['type'], inplace=True)
         df.drop(columns=['timestamp'], inplace=True)
         self.lib.append(self.key, df, upsert=True)
 
@@ -68,3 +74,19 @@ class LiquidationsArctic(ArcticCallback, BackendCallback):
 
 class CandlesArctic(ArcticCallback, BackendCallback):
     default_key = CANDLES
+
+
+class OrderInfoArctic(ArcticCallback, BackendCallback):
+    default_key = ORDER_INFO
+
+
+class TransactionsArctic(ArcticCallback, BackendCallback):
+    default_key = TRANSACTIONS
+
+
+class BalancesArctic(ArcticCallback, BackendCallback):
+    default_key = BALANCES
+
+
+class FillsArctic(ArcticCallback, BackendCallback):
+    default_key = FILLS

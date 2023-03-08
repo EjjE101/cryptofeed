@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2023 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -8,11 +8,12 @@ from decimal import Decimal
 import logging
 
 from yapic import json
+from cryptofeed.connection import RestEndpoint, Routes, WebsocketEndpoint
 
 from cryptofeed.defines import BALANCES, BINANCE_DELIVERY, BUY, FUNDING, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL
 from cryptofeed.exchanges.binance import Binance
 from cryptofeed.exchanges.mixins.binance_rest import BinanceDeliveryRestMixin
-from cryptofeed.types import OrderInfo
+from cryptofeed.types import Balance, OrderInfo, Position
 
 
 LOG = logging.getLogger('feedhandler')
@@ -20,8 +21,11 @@ LOG = logging.getLogger('feedhandler')
 
 class BinanceDelivery(Binance, BinanceDeliveryRestMixin):
     id = BINANCE_DELIVERY
-    symbol_endpoint = 'https://dapi.binance.com/dapi/v1/exchangeInfo'
-    listen_key_endpoint = 'listenKey'
+
+    # https://binance-docs.github.io/apidocs/delivery/en/#testnet
+    websocket_endpoints = [WebsocketEndpoint('wss://dstream.binance.com', options={'compression': None}, sandbox='wss://dstream.binancefuture.com')]
+    rest_endpoints = [RestEndpoint('https://dapi.binance.com', routes=Routes('/dapi/v1/exchangeInfo', l2book='/dapi/v1/depth?symbol={}&limit={}', authentication='/dapi/v1/listenKey'), sandbox='https://testnet.binancefuture.com')]
+
     valid_depths = [5, 10, 20, 50, 100, 500, 1000]
     valid_depth_intervals = {'100ms', '250ms', '500ms'}
     websocket_channels = {
@@ -31,14 +35,6 @@ class BinanceDelivery(Binance, BinanceDeliveryRestMixin):
         LIQUIDATIONS: 'forceOrder',
         POSITIONS: POSITIONS
     }
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # overwrite values previously set by the super class Binance
-        self.ws_endpoint = 'wss://dstream.binance.com'
-        self.rest_endpoint = 'https://dapi.binance.com/dapi/v1'
-        self.address = self._address()
-        self.ws_defaults['compression'] = None
 
     def _check_update_id(self, pair: str, msg: dict) -> bool:
         if self._l2_book[pair].delta is None and msg['u'] < self.last_update_id[pair]:
@@ -112,21 +108,24 @@ class BinanceDelivery(Binance, BinanceDeliveryRestMixin):
         }
         """
         for balance in msg['a']['B']:
-            await self.callback(BALANCES,
-                                feed=self.id,
-                                symbol=balance['a'],
-                                timestamp=self.timestamp_normalize(msg['E']),
-                                receipt_timestamp=timestamp,
-                                wallet_balance=Decimal(balance['wb']))
+            b = Balance(
+                self.id,
+                balance['a'],
+                Decimal(balance['wb']),
+                None,
+                raw=msg)
+            await self.callback(BALANCES, b, timestamp)
         for position in msg['a']['P']:
-            await self.callback(POSITIONS,
-                                feed=self.id,
-                                symbol=self.exchange_symbol_to_std_symbol(position['s']),
-                                timestamp=self.timestamp_normalize(msg['E']),
-                                receipt_timestamp=timestamp,
-                                position_amount=Decimal(position['pa']),
-                                entry_price=Decimal(position['ep']),
-                                unrealised_pnl=Decimal(position['up']))
+            p = Position(
+                self.id,
+                self.exchange_symbol_to_std_symbol(position['s']),
+                Decimal(position['pa']),
+                Decimal(position['ep']),
+                position['ps'].lower(),
+                Decimal(position['up']),
+                self.timestamp_normalize(msg['E']),
+                raw=msg)
+            await self.callback(POSITIONS, p, timestamp)
 
     async def _order_update(self, msg: dict, timestamp: float):
         """
@@ -178,7 +177,7 @@ class BinanceDelivery(Binance, BinanceDeliveryRestMixin):
         oi = OrderInfo(
             self.id,
             self.exchange_symbol_to_std_symbol(msg['o']['s']),
-            msg['o']['i'],
+            str(msg['o']['i']),
             BUY if msg['o']['S'].lower() == 'buy' else SELL,
             msg['o']['x'],
             LIMIT if msg['o']['o'].lower() == 'limit' else MARKET if msg['o']['o'].lower() == 'market' else None,

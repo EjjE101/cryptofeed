@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2023 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -13,7 +13,7 @@ from collections import defaultdict
 
 from yapic import json
 
-from cryptofeed.connection import AsyncConnection
+from cryptofeed.connection import AsyncConnection, RestEndpoint, Routes, WebsocketEndpoint
 from cryptofeed.defines import BID, ASK, BUY, COINBASE, L2_BOOK, L3_BOOK, SELL, TICKER, TRADES
 from cryptofeed.feed import Feed
 from cryptofeed.symbols import Symbol
@@ -26,7 +26,9 @@ LOG = logging.getLogger('feedhandler')
 
 class Coinbase(Feed, CoinbaseRestMixin):
     id = COINBASE
-    symbol_endpoint = 'https://api.pro.coinbase.com/products'
+    websocket_endpoints = [WebsocketEndpoint('wss://ws-feed.pro.coinbase.com', options={'compression': None})]
+    rest_endpoints = [RestEndpoint('https://api.pro.coinbase.com', routes=Routes('/products', l3book='/products/{}/book?level=3'))]
+
     websocket_channels = {
         L2_BOOK: 'level2',
         L3_BOOK: 'full',
@@ -36,19 +38,20 @@ class Coinbase(Feed, CoinbaseRestMixin):
     request_limit = 10
 
     @classmethod
-    def _parse_symbol_data(cls, data: dict) -> Tuple[Dict, Dict]:
+    def _parse_symbol_data(cls, data: list) -> Tuple[Dict, Dict]:
         ret = {}
         info = defaultdict(dict)
 
         for entry in data:
-            sym = Symbol(entry['base_currency'], entry['quote_currency'])
+            base, quote = entry['id'].split("-")
+            sym = Symbol(base, quote)
             info['tick_size'][sym.normalized] = entry['quote_increment']
             info['instrument_type'][sym.normalized] = sym.type
             ret[sym.normalized] = entry['id']
         return ret, info
 
     def __init__(self, callbacks=None, **kwargs):
-        super().__init__('wss://ws-feed.pro.coinbase.com', callbacks=callbacks, **kwargs)
+        super().__init__(callbacks=callbacks, **kwargs)
         # we only keep track of the L3 order book if we have at least one subscribed order-book callback.
         # use case: subscribing to the L3 book plus Trade type gives you order_type information (see _received below),
         # and we don't need to do the rest of the book-keeping unless we have an active callback
@@ -57,24 +60,17 @@ class Coinbase(Feed, CoinbaseRestMixin):
             self.keep_l3_book = True
         self.__reset()
 
-    def __reset(self, symbol=None):
-        if symbol:
-            self.seq_no[symbol] = None
-            self.order_map.pop(symbol, None)
-            self.order_type_map.pop(symbol, None)
-            self._l3_book.pop(symbol, None)
-            self._l2_book.pop(symbol, None)
-        else:
-            self.order_map = {}
-            self.order_type_map = {}
-            self.seq_no = None
-            # sequence number validation only works when the FULL data stream is enabled
-            chan = self.std_channel_to_exchange(L3_BOOK)
-            if chan in self.subscription:
-                pairs = self.subscription[chan]
-                self.seq_no = {pair: None for pair in pairs}
-            self._l3_book = {}
-            self._l2_book = {}
+    def __reset(self):
+        self.order_map = {}
+        self.order_type_map = {}
+        self.seq_no = None
+        # sequence number validation only works when the FULL data stream is enabled
+        chan = self.std_channel_to_exchange(L3_BOOK)
+        if chan in self.subscription:
+            pairs = self.subscription[chan]
+            self.seq_no = {pair: None for pair in pairs}
+        self._l3_book = {}
+        self._l2_book = {}
 
     async def _ticker(self, msg: dict, timestamp: float):
         '''
@@ -110,7 +106,9 @@ class Coinbase(Feed, CoinbaseRestMixin):
             'last_size': '0.00241692'
         }
         '''
-        await self.callback(TICKER, Ticker(self.id, self.exchange_symbol_to_std_symbol(msg['product_id']), Decimal(msg['best_bid']), Decimal(msg['best_ask']), self.timestamp_normalize(msg['time']), raw=msg), timestamp)
+
+        ts = self.timestamp_normalize(msg['time']) if 'time' in msg else None
+        await self.callback(TICKER, Ticker(self.id, self.exchange_symbol_to_std_symbol(msg['product_id']), Decimal(msg['best_bid']), Decimal(msg['best_ask']), ts, raw=msg), timestamp)
 
     async def _book_update(self, msg: dict, timestamp: float):
         '''
@@ -204,8 +202,7 @@ class Coinbase(Feed, CoinbaseRestMixin):
         # the subsequent messages, causing a seq no mismatch.
         await asyncio.sleep(2)
 
-        url = 'https://api.pro.coinbase.com/products/{}/book?level=3'
-        urls = [url.format(pair) for pair in pairs]
+        urls = [self.rest_endpoints[0].route('l3book', self.sandbox).format(pair) for pair in pairs]
 
         results = []
         for url in urls:
@@ -307,6 +304,8 @@ class Coinbase(Feed, CoinbaseRestMixin):
         Not all done or change messages will result in changing the order book. These messages will
         be sent for received orders which are not yet on the order book. Do not alter
         the order book for such messages, otherwise your order book will be incorrect.
+
+        {'price': '16556.88', 'old_size': '0.24076471', 'new_size': '0.04076471', 'order_id': '9675d63e-0432-413d-a3f3-f30d7df39614', 'reason': 'STP', 'type': 'change', 'side': 'buy', 'product_id': 'BTC-USD', 'time': datetime.datetime(2022, 11, 24, 0, 35, 28, 904847, tzinfo=datetime.timezone.utc), 'sequence': 50703787284}
         """
         if not self.keep_l3_book:
             return
@@ -378,8 +377,8 @@ class Coinbase(Feed, CoinbaseRestMixin):
             # PERF perf_end(self.id, 'msg')
             # PERF perf_log(self.id, 'msg')
 
-    async def subscribe(self, conn: AsyncConnection, symbol=None):
-        self.__reset(symbol=symbol)
+    async def subscribe(self, conn: AsyncConnection):
+        self.__reset()
 
         for chan in self.subscription:
             await conn.write(json.dumps({"type": "subscribe",

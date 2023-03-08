@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2023 Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -27,7 +27,7 @@ from cryptofeed.backends.backend import BackendBookCallback, BackendCallback
 class GCPPubSubCallback:
     def __init__(self, topic: Optional[str] = None, key: Optional[str] = None,
                  service_file: Optional[Union[str, IO[AnyStr]]] = None,
-                 ordering_key: Optional[Union[str, io.IOBase]] = None, numeric_type=float):
+                 ordering_key: Optional[Union[str, io.IOBase]] = None, numeric_type=float, none_to=None):
         '''
         Backend using Google Cloud Platform Pub/Sub. Use requires an account with Google Cloud Platform.
         Free tier allows 10GB messages per month.
@@ -57,6 +57,7 @@ class GCPPubSubCallback:
         self.key = key or self.default_key
         self.ordering_key = ordering_key
         self.numeric_type = numeric_type
+        self.none_to = none_to
         self.topic = topic or f'cryptofeed-{self.key}'
         self.topic_path = self.get_topic()
         self.service_file = service_file
@@ -130,3 +131,19 @@ class LiquidationsGCPPubSub(GCPPubSubCallback, BackendCallback):
 
 class CandlesGCPPubSub(GCPPubSubCallback, BackendCallback):
     default_key = 'candles'
+
+
+class OrderInfoGCPPubSub(GCPPubSubCallback, BackendCallback):
+    default_key = 'order_info'
+
+
+class TransactionsGCPPubSub(GCPPubSubCallback, BackendCallback):
+    default_key = 'transactions'
+
+
+class BalancesGCPPubSub(GCPPubSubCallback, BackendCallback):
+    default_key = 'balances'
+
+
+class FillsGCPPubSub(GCPPubSubCallback, BackendCallback):
+    default_key = 'fills'
